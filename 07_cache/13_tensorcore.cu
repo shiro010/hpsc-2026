@@ -13,10 +13,12 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   int offset_a_m = 64 * blockIdx.x;
   int offset_b_n = 64 * blockIdx.y;
   int i = threadIdx.x;
-  int warp_id = threadIdx.x / 32;
+  int warp_id = threadIdx.x >> 5;
 
-  __shared__ half block_a[16][64];
-  __shared__ half block_b[16][64];
+  constexpr int SMEM_A_LD = 72;
+  constexpr int SMEM_B_LD = 72;
+  __shared__ half block_a[16][SMEM_A_LD];
+  __shared__ half block_b[16][SMEM_B_LD];
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
   for (int r = 0; r < 2; r++)
@@ -27,16 +29,22 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     __syncthreads();
     for (int j = 0; j < 16; ++j) {
       block_a[j][i] = __float2half(d_a[(k + j) * dim_m + offset_a_m + i]);
-      block_b[j][i] = __float2half(d_b[(offset_b_n + i) * dim_k + k + j]);
     }
+
+    int bk = i & 15;
+    int bn = i >> 4;
+    for (; bn < 64; bn += 4) {
+      block_b[bk][bn] = __float2half(d_b[(offset_b_n + bn) * dim_k + k + bk]);
+    }
+
     __syncthreads();
     for (int r = 0; r < 2; r++) {
       int row_tile = warp_id * 2 + r;
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], 64);
+      wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], SMEM_A_LD);
       for (int c = 0; c < 4; c++) {
         wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-        wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], 64);
+        wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], SMEM_B_LD);
         wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
       }
     }
@@ -45,8 +53,7 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     for (int c = 0; c < 4; c++) {
       int c_m = offset_a_m + (warp_id * 2 + r) * 16;
       int c_n = offset_b_n + c * 16;
-      if (c_n < dim_n && c_m < dim_m)
-        wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
+      wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major); // m,nが64の倍数のみifを外せる
     }
   }
 }
@@ -96,6 +103,7 @@ int main(int argc, const char **argv) {
   int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
+  
   int tile = 64;
   dim3 block = dim3(tile);
   dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
